@@ -1,0 +1,8 @@
+{
+    "id": "com.steno.api-suite",
+    "name": "API Test Suite",
+    "description": "Comprehensive testing framework for Subway Builder Modding API",
+    "version": "1.0.0",
+    "author": { "name": "Steno" },
+    "main": "index.js"
+}
