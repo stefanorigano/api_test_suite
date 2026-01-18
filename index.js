@@ -1,3 +1,715 @@
+// ============================================================================
+// LIFECYCLE MONITOR (Vanilla JS - Loads First)
+// ============================================================================
+
+const LifecycleMonitor = (function() {
+    'use strict';
+    
+    const STORAGE_KEY = 'LifecycleMonitor_Events';
+    const MAX_EVENTS = 200;
+    
+    // DOM Selectors
+    const SELECTORS = {
+        // Context detection
+        MAIN_MENU: 'main.justify-center',
+        IN_GAME_MENU: 'div[data-mod-id="escape-menu"]',
+        LOAD_SAVE_SCREEN: 'main.grid.gap-8.min-h-screen.p-8.max-w-4xl.mx-auto',
+        
+        // In-game time
+        CLOCK_DAY: 'div[data-mod-id="clock"] p.font-medium',
+        CLOCK_TIME: 'div[data-mod-id="clock"] p.font-mono'
+    };
+    
+    // State machine
+    const STATES = {
+        UNINITIALIZED: 'uninitialized',
+        API_READY: 'api_ready',
+        USER_STARTING_NEW_GAME: 'user_starting_new_game',
+        USER_LOADING_SAVE: 'user_loading_save',
+        CITY_LOADING: 'city_loading',
+        GAME_INIT: 'game_init',
+        IN_GAME: 'in_game',
+        MENU: 'menu'
+    };
+    
+    const VALID_TRANSITIONS = {
+        [STATES.UNINITIALIZED]: [STATES.API_READY],
+        [STATES.API_READY]: [STATES.USER_STARTING_NEW_GAME, STATES.USER_LOADING_SAVE, STATES.CITY_LOADING, STATES.GAME_INIT],
+        [STATES.USER_STARTING_NEW_GAME]: [STATES.CITY_LOADING, STATES.GAME_INIT],
+        [STATES.USER_LOADING_SAVE]: [STATES.CITY_LOADING, STATES.GAME_INIT],
+        [STATES.CITY_LOADING]: [STATES.GAME_INIT, STATES.IN_GAME],
+        [STATES.GAME_INIT]: [STATES.IN_GAME],
+        [STATES.IN_GAME]: [STATES.MENU, STATES.CITY_LOADING, STATES.USER_LOADING_SAVE],
+        [STATES.MENU]: [STATES.USER_STARTING_NEW_GAME, STATES.USER_LOADING_SAVE, STATES.CITY_LOADING, STATES.GAME_INIT]
+    };
+    
+    // Monitor state
+    let currentState = STATES.UNINITIALIZED;
+    let events = [];
+    let startTime = Date.now();
+    let saveName = null;
+    let cityCode = null;
+    let isCollapsed = false;
+    let validTransitions = 0;
+    let errorCount = 0;
+    
+    // User action tracking
+    let pendingLoadSaveName = null;
+    let loadClickTime = null;
+    
+    // Scenario tracking
+    const scenarios = {
+        'new_game_from_menu': { detected: false, name: 'New Game from Menu' },
+        'load_save_from_menu': { detected: false, name: 'Load Save from Menu' },
+        'game_to_menu_to_new': { detected: false, name: 'Game → Menu → New Game' },
+        'game_reload_same_save': { detected: false, name: 'Game → Reload Same Save' },
+        'game_load_different_save': { detected: false, name: 'Game → Load Different Save' }
+    };
+    
+    // UI Elements
+    let panel = null;
+    let timelineEl = null;
+    let stateEl = null;
+    let saveNameEl = null;
+    let statsEl = null;
+    let scenariosEl = null;
+    let contentEl = null;
+    let toggleBtn = null;
+    
+    // ============================================================================
+    // CORE FUNCTIONS
+    // ============================================================================
+    
+    function init() {
+        loadEvents();
+        createPanel();
+        logEvent('Script Loaded', 'system');
+        
+        // Setup DOM listeners immediately
+        setupDOMListeners();
+        
+        // Wait for API
+        const checkAPI = setInterval(() => {
+            if (window.SubwayBuilderAPI) {
+                clearInterval(checkAPI);
+                onAPIReady();
+            }
+        }, 100);
+        
+        console.info('[LIFECYCLE] Monitor initialized');
+    }
+    
+    function setupDOMListeners() {
+        // Use event delegation for dynamically added elements
+        document.addEventListener('click', (e) => {
+            const target = e.target;
+            
+            // Helper to check if click is within an element
+            const isWithin = (selector) => target.closest(selector) !== null;
+            
+            // New Game (Main Menu)
+            if (isWithin('main.justify-center') && target.textContent.includes('New Game')) {
+                const context = detectContext();
+                logEvent('User clicked: New Game', 'user_action');
+                
+                if (context === 'main_menu') {
+                    transitionState(STATES.USER_STARTING_NEW_GAME);
+                    detectScenario('user_new_game_from_menu');
+                }
+            }
+            
+            // Load/Save from Main Menu
+            if (isWithin('main.justify-center') && target.textContent.includes('Load/Save')) {
+                logEvent('User clicked: Load/Save (Main Menu)', 'user_action');
+            }
+            
+            // Load/Save from In-Game Menu
+            if (isWithin('div[data-mod-id="escape-menu"]') && target.textContent.includes('Load/Save')) {
+                logEvent('User clicked: Load/Save (In-Game)', 'user_action');
+            }
+            
+            // Load Button (specific save)
+            if (isWithin('button') && 
+                target.textContent.includes('Load') &&
+                isWithin('main.grid.gap-8')) {
+                
+                const saveBlock = target.closest('.panel-blur');
+                const saveNameEl = saveBlock?.querySelector('.text-base.font-black');
+                const clickedSaveName = saveNameEl?.textContent.trim() || 'unknown';
+                
+                logEvent(`User clicked: Load "${clickedSaveName}"`, 'user_action');
+                
+                // Track for verification when load completes
+                pendingLoadSaveName = clickedSaveName;
+                loadClickTime = Date.now();
+                
+                const context = detectContext();
+                if (context === 'in_game') {
+                    transitionState(STATES.USER_LOADING_SAVE);
+                } else {
+                    transitionState(STATES.USER_LOADING_SAVE);
+                }
+            }
+            
+            // Save Button
+            if (isWithin('button') && 
+                target.textContent.includes('Save') &&
+                target.closest('.grid.gap-2')) {
+                
+                const saveInput = document.querySelector('input[placeholder="Enter save name..."]');
+                const saveNameToSave = saveInput?.value || 'unnamed';
+                
+                logEvent(`User clicked: Save "${saveNameToSave}"`, 'user_action');
+            }
+            
+            // Menu Toggle (hamburger)
+            if (isWithin('.lucide-menu')) {
+                const menuVisible = document.querySelector('div[data-mod-id="escape-menu"]') !== null;
+                logEvent(`User clicked: ${menuVisible ? 'Close' : 'Open'} Menu`, 'user_action');
+            }
+            
+        }, true); // Use capture phase
+        
+        logEvent('DOM listeners initialized', 'system');
+    }
+    
+    function detectContext() {
+        if (document.querySelector(SELECTORS.MAIN_MENU)) {
+            return 'main_menu';
+        }
+        if (document.querySelector(SELECTORS.IN_GAME_MENU)) {
+            return 'in_game';
+        }
+        if (document.querySelector(SELECTORS.LOAD_SAVE_SCREEN)) {
+            return 'load_save_screen';
+        }
+        return 'unknown';
+    }
+    
+    function onAPIReady() {
+        logEvent('API Available', 'api');
+        transitionState(STATES.API_READY);
+        
+        // Hook call counters
+        let gameInitCount = 0;
+        let cityLoadCount = 0;
+        let mapReadyCount = 0;
+        
+        // Register hooks
+        const api = window.SubwayBuilderAPI;
+        
+        api.hooks.onGameInit(() => {
+            gameInitCount++;
+            logEvent(`Game Init (call #${gameInitCount})`, 'lifecycle');
+            
+            if (gameInitCount > 1) {
+                logEvent(`Game Init called multiple times! (${gameInitCount} total)`, 'error', true);
+                errorCount++;
+                updateStats();
+            }
+            
+            // Only transition to GAME_INIT if we're in an earlier state
+            if (currentState === STATES.CITY_LOADING || 
+                currentState === STATES.USER_STARTING_NEW_GAME ||
+                currentState === STATES.USER_LOADING_SAVE ||
+                currentState === STATES.API_READY) {
+                transitionState(STATES.GAME_INIT);
+            } else {
+                logEvent(`Game Init in unexpected state: ${currentState}`, 'info');
+            }
+        });
+        
+        api.hooks.onCityLoad((code) => {
+            cityLoadCount++;
+            cityCode = code;
+            logEvent(`City Load: ${code} (call #${cityLoadCount})`, 'lifecycle');
+            
+            if (cityLoadCount > 1 && currentState !== STATES.IN_GAME && currentState !== STATES.GAME_INIT) {
+                logEvent(`City Load called multiple times in same session! (${cityLoadCount} total)`, 'error', true);
+                errorCount++;
+                updateStats();
+            }
+            
+            // Transition to CITY_LOADING state
+            if (currentState === STATES.API_READY || 
+                currentState === STATES.MENU ||
+                currentState === STATES.USER_STARTING_NEW_GAME ||
+                currentState === STATES.USER_LOADING_SAVE) {
+                transitionState(STATES.CITY_LOADING);
+            } else if (currentState === STATES.IN_GAME || currentState === STATES.GAME_INIT) {
+                // Reloading a save while in game
+                transitionState(STATES.CITY_LOADING);
+            }
+            
+            updatePanel();
+        });
+        
+        api.hooks.onMapReady(() => {
+            mapReadyCount++;
+            logEvent(`Map Ready (call #${mapReadyCount})`, 'lifecycle');
+            
+            if (mapReadyCount > 1 && currentState === STATES.IN_GAME) {
+                logEvent(`Map Ready called multiple times! (${mapReadyCount} total)`, 'error', true);
+                errorCount++;
+                updateStats();
+            }
+            
+            // Transition to IN_GAME if we're in GAME_INIT or CITY_LOADING
+            if (currentState === STATES.GAME_INIT || currentState === STATES.CITY_LOADING) {
+                transitionState(STATES.IN_GAME);
+            }
+            
+            detectScenario('map_ready');
+        });
+        
+        api.hooks.onGameLoaded((name) => {
+            const wasSameSave = saveName === name;
+            saveName = name;
+            
+            // Verify load completion if we were tracking a pending load
+            if (pendingLoadSaveName && loadClickTime) {
+                const loadDuration = Date.now() - loadClickTime;
+                const nameMatches = pendingLoadSaveName === name;
+                
+                if (nameMatches) {
+                    logEvent(`Game Loaded: ${name} (took ${(loadDuration / 1000).toFixed(1)}s)`, 'lifecycle');
+                } else {
+                    logEvent(`Game Loaded: ${name} (expected "${pendingLoadSaveName}")`, 'error', true);
+                    errorCount++;
+                }
+                
+                pendingLoadSaveName = null;
+                loadClickTime = null;
+            } else {
+                logEvent(`Game Loaded: ${name}${wasSameSave ? ' (SAME)' : ''}`, 'lifecycle');
+            }
+            
+            if (wasSameSave) {
+                detectScenario('reload_same_save');
+            } else if (saveName) {
+                detectScenario('load_different_save');
+            }
+            
+            updatePanel();
+        });
+        
+        api.hooks.onGameSaved((name) => {
+            logEvent(`Game Saved: ${name}`, 'lifecycle');
+        });
+        
+        // Test onDemandChange hook (known bug: fires incorrectly)
+        let demandChangeCount = 0;
+        let demandChangeDuringGameplay = 0;
+        
+        api.hooks.onDemandChange((popCount) => {
+            demandChangeCount++;
+            const inGameplay = currentState === STATES.IN_GAME;
+            
+            if (inGameplay) {
+                demandChangeDuringGameplay++;
+            }
+            
+            logEvent(`onDemandChange fired (call #${demandChangeCount}, ${inGameplay ? 'IN-GAME' : 'PRE-GAME'}, pops: ${popCount})`, 'lifecycle');
+            
+            // After a reasonable period, check if it behaved correctly
+            if (demandChangeCount >= 3) {
+                const behavedCorrectly = demandChangeDuringGameplay > 0 && demandChangeCount <= 3;
+                
+                if (!behavedCorrectly) {
+                    logEvent(`onDemandChange behavior incorrect: ${demandChangeCount} total calls, ${demandChangeDuringGameplay} during gameplay`, 'error', true);
+                    errorCount++;
+                    updateStats();
+                }
+            }
+        });
+    }
+    
+    function logEvent(message, type = 'info', isError = false) {
+        const timestamp = Date.now() - startTime;
+        const event = {
+            timestamp,
+            message,
+            type,
+            isError,
+            state: currentState,
+            time: new Date().toISOString()
+        };
+        
+        events.push(event);
+        
+        // Trim to max events
+        if (events.length > MAX_EVENTS) {
+            events = events.slice(-MAX_EVENTS);
+        }
+        
+        saveEvents();
+        updateTimeline();
+        
+        const icon = isError ? '❌' : type === 'system' ? '🔧' : type === 'api' ? '⚙️' : type === 'user_action' ? '👆' : '🎮';
+        console.info(`[LIFECYCLE] ${icon} ${formatTimestamp(timestamp)} - ${message}`);
+    }
+    
+    function transitionState(newState) {
+        const validTransition = VALID_TRANSITIONS[currentState]?.includes(newState);
+        
+        if (!validTransition && currentState !== STATES.UNINITIALIZED) {
+            errorCount++;
+            logEvent(
+                `Invalid transition: ${currentState} → ${newState}`,
+                'error',
+                true
+            );
+            updateStats();
+            return false;
+        }
+        
+        const oldState = currentState;
+        currentState = newState;
+        validTransitions++;
+        
+        logEvent(`State: ${oldState} → ${newState}`, 'transition');
+        updateStats();
+        updateState();
+        
+        return true;
+    }
+    
+    function detectScenario(trigger) {
+        // New Game from Menu
+        if (trigger === 'user_new_game_from_menu') {
+            scenarios.new_game_from_menu.detected = true;
+        }
+        
+        // Load Save from Menu
+        if (trigger === 'map_ready' && saveName && events.length <= 10) {
+            scenarios.load_save_from_menu.detected = true;
+        }
+        
+        // Game → Reload Same Save
+        if (trigger === 'reload_same_save') {
+            scenarios.game_reload_same_save.detected = true;
+        }
+        
+        // Game → Load Different Save
+        if (trigger === 'load_different_save') {
+            scenarios.game_load_different_save.detected = true;
+        }
+        
+        updateScenarios();
+    }
+    
+    // ============================================================================
+    // STORAGE
+    // ============================================================================
+    
+    function loadEvents() {
+        try {
+            const stored = localStorage.getItem(STORAGE_KEY);
+            if (stored) {
+                const data = JSON.parse(stored);
+                events = data.events || [];
+                validTransitions = data.validTransitions || 0;
+                errorCount = data.errorCount || 0;
+            }
+        } catch (error) {
+            console.error('[LIFECYCLE] Failed to load events:', error);
+            events = [];
+        }
+    }
+    
+    function saveEvents() {
+        try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify({
+                events,
+                validTransitions,
+                errorCount,
+                savedAt: new Date().toISOString()
+            }));
+        } catch (error) {
+            console.error('[LIFECYCLE] Failed to save events:', error);
+        }
+    }
+    
+    function clearEvents() {
+        events = [];
+        validTransitions = 0;
+        errorCount = 0;
+        Object.keys(scenarios).forEach(key => {
+            scenarios[key].detected = false;
+        });
+        saveEvents();
+        updatePanel();
+        logEvent('Log Cleared', 'system');
+    }
+    
+    function exportLogs() {
+        const data = {
+            exportedAt: new Date().toISOString(),
+            storageKey: STORAGE_KEY,
+            currentState,
+            saveName,
+            cityCode,
+            validTransitions,
+            errorCount,
+            scenarios: Object.keys(scenarios).reduce((acc, key) => {
+                acc[key] = scenarios[key].detected;
+                return acc;
+            }, {}),
+            events: events.map(e => ({
+                timestamp: formatTimestamp(e.timestamp),
+                message: e.message,
+                type: e.type,
+                isError: e.isError,
+                state: e.state
+            }))
+        };
+        
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `lifecycle-log-${Date.now()}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+        
+        logEvent('Logs Exported', 'system');
+    }
+    
+    // ============================================================================
+    // UI CREATION
+    // ============================================================================
+    
+    function createPanel() {
+        // Create container with Tailwind classes
+        panel = document.createElement('div');
+        panel.id = 'lifecycle-monitor';
+        panel.className = 'fixed top-14 left-16 w-[400px] bg-background/95 backdrop-blur-sm border-2 border-border rounded-lg shadow-2xl z-[999999] font-mono text-xs';
+        
+        // Header
+        const header = document.createElement('div');
+        header.className = 'px-3 py-2.5 bg-muted border-b border-border flex justify-between items-center cursor-pointer';
+        header.innerHTML = `
+            <div class="flex items-center gap-2">
+                <span class="text-base">🔄</span>
+                <span class="font-semibold">Lifecycle Monitor</span>
+            </div>
+        `;
+        
+        toggleBtn = document.createElement('button');
+        toggleBtn.className = 'text-muted-foreground hover:text-foreground transition-colors';
+        toggleBtn.textContent = '▼';
+        header.appendChild(toggleBtn);
+        
+        header.onclick = toggleCollapse;
+        
+        // Content container
+        contentEl = document.createElement('div');
+        contentEl.id = 'lifecycle-content';
+        contentEl.className = 'max-h-[600px] overflow-hidden transition-all duration-300';
+        
+        // State info
+        const stateInfo = document.createElement('div');
+        stateInfo.className = 'px-3 py-2.5 border-b border-border bg-muted/50 space-y-2';
+        stateInfo.innerHTML = `
+            <div class="flex items-center gap-2">
+                <span class="font-medium text-muted-foreground">State:</span>
+                <span id="lifecycle-state" class="font-bold text-green-500"></span>
+            </div>
+            <div class="flex items-center gap-2">
+                <span class="font-medium text-muted-foreground">Save:</span>
+                <span id="lifecycle-save" class="text-blue-400"></span>
+            </div>
+            <div id="lifecycle-stats" class="text-xs"></div>
+            <div class="pt-2 mt-2 border-t border-border text-[10px] text-muted-foreground">
+                Storage: <code class="text-muted-foreground/60">${STORAGE_KEY}</code>
+            </div>
+        `;
+        
+        stateEl = stateInfo.querySelector('#lifecycle-state');
+        saveNameEl = stateInfo.querySelector('#lifecycle-save');
+        statsEl = stateInfo.querySelector('#lifecycle-stats');
+        
+        // Timeline
+        const timelineContainer = document.createElement('div');
+        timelineContainer.className = 'px-3 py-2.5 max-h-[300px] overflow-y-auto border-b border-border bg-background/50';
+        timelineContainer.innerHTML = `
+            <div class="mb-2 font-semibold text-muted-foreground">Timeline (last 20 events):</div>
+            <div id="lifecycle-timeline" class="text-[11px] leading-relaxed space-y-1"></div>
+        `;
+        timelineEl = timelineContainer.querySelector('#lifecycle-timeline');
+        
+        // Scenarios
+        const scenariosContainer = document.createElement('div');
+        scenariosContainer.className = 'px-3 py-2.5 border-b border-border bg-muted/50';
+        scenariosContainer.innerHTML = `
+            <div class="mb-2 font-semibold text-muted-foreground">Scenarios Detected:</div>
+            <div id="lifecycle-scenarios" class="text-[11px] leading-relaxed space-y-1"></div>
+        `;
+        scenariosEl = scenariosContainer.querySelector('#lifecycle-scenarios');
+        
+        // Buttons
+        const buttons = document.createElement('div');
+        buttons.className = 'px-3 py-2.5 flex gap-2 flex-wrap';
+        
+        const clearBtn = document.createElement('button');
+        clearBtn.className = 'px-3 py-1.5 bg-destructive text-destructive-foreground rounded-md hover:bg-destructive/90 transition-colors font-medium';
+        clearBtn.textContent = 'Clear Log';
+        clearBtn.onclick = () => {
+            if (confirm('Clear all lifecycle logs?')) {
+                clearEvents();
+            }
+        };
+        
+        const exportBtn = document.createElement('button');
+        exportBtn.className = 'px-3 py-1.5 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 transition-colors font-medium';
+        exportBtn.textContent = 'Export JSON';
+        exportBtn.onclick = exportLogs;
+        
+        buttons.appendChild(clearBtn);
+        buttons.appendChild(exportBtn);
+        
+        // Assemble panel
+        contentEl.appendChild(stateInfo);
+        contentEl.appendChild(timelineContainer);
+        contentEl.appendChild(scenariosContainer);
+        contentEl.appendChild(buttons);
+        
+        panel.appendChild(header);
+        panel.appendChild(contentEl);
+        
+        document.body.appendChild(panel);
+        
+        // Initial update
+        updatePanel();
+    }
+    
+    function toggleCollapse() {
+        isCollapsed = !isCollapsed;
+        
+        if (isCollapsed) {
+            contentEl.style.maxHeight = '0';
+            toggleBtn.textContent = '▶';
+        } else {
+            contentEl.style.maxHeight = '600px';
+            toggleBtn.textContent = '▼';
+        }
+    }
+    
+    // ============================================================================
+    // UI UPDATES
+    // ============================================================================
+    
+    function updatePanel() {
+        updateState();
+        updateStats();
+        updateTimeline();
+        updateScenarios();
+    }
+    
+    function updateState() {
+        if (stateEl) {
+            stateEl.textContent = currentState.toUpperCase().replace(/_/g, ' ');
+            stateEl.className = `font-bold ${errorCount > 0 ? 'text-red-500' : 'text-green-500'}`;
+        }
+        if (saveNameEl) {
+            saveNameEl.textContent = saveName || 'None';
+        }
+    }
+    
+    function updateStats() {
+        if (statsEl) {
+            statsEl.innerHTML = `
+                <span class="font-medium text-muted-foreground">Transitions:</span>
+                <span class="text-green-500">${validTransitions} ✓</span>
+                <span class="text-muted-foreground">|</span>
+                <span class="font-medium text-muted-foreground">Errors:</span>
+                <span class="${errorCount > 0 ? 'text-red-500' : 'text-green-500'}">${errorCount}</span>
+            `;
+        }
+    }
+    
+    function updateTimeline() {
+        if (!timelineEl) return;
+        
+        const recent = events.slice(-20);
+        timelineEl.innerHTML = recent.map(event => {
+            let colorClass = 'text-green-500';
+            let icon = '⏱️';
+            
+            if (event.isError) {
+                colorClass = 'text-red-500';
+                icon = '❌';
+            } else if (event.type === 'system') {
+                colorClass = 'text-muted-foreground';
+                icon = '🔧';
+            } else if (event.type === 'api') {
+                colorClass = 'text-blue-400';
+                icon = '⚙️';
+            } else if (event.type === 'transition') {
+                colorClass = 'text-purple-400';
+                icon = '🔄';
+            } else if (event.type === 'user_action') {
+                colorClass = 'text-cyan-400';
+                icon = '👆';
+            }
+            
+            return `
+                <div class="${colorClass}">
+                    ${icon} ${formatTimestamp(event.timestamp)} - ${escapeHtml(event.message)}
+                </div>
+            `;
+        }).join('');
+    }
+    
+    function updateScenarios() {
+        if (!scenariosEl) return;
+        
+        scenariosEl.innerHTML = Object.entries(scenarios).map(([key, data]) => {
+            const icon = data.detected ? '✓' : '○';
+            const colorClass = data.detected ? 'text-green-500' : 'text-muted-foreground/50';
+            return `<div class="${colorClass}">${icon} ${data.name}</div>`;
+        }).join('');
+    }
+    
+    // ============================================================================
+    // UTILS
+    // ============================================================================
+    
+    function formatTimestamp(ms) {
+        const seconds = Math.floor(ms / 1000);
+        const milliseconds = ms % 1000;
+        const minutes = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        
+        return `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${String(milliseconds).padStart(3, '0')}`;
+    }
+    
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+    
+    // Initialize immediately
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+    
+    // Public API
+    return {
+        logEvent,
+        clearEvents,
+        exportLogs,
+        getEvents: () => events,
+        getCurrentState: () => currentState,
+        detectContext
+    };
+})();
+
+
+
 // API Test Suite Mod v1.0.0
 // Comprehensive testing framework for Subway Builder Modding API
 // Tests hooks, UI components, lifecycle, actions, and known bugs
@@ -775,8 +1487,18 @@ const APITestSuite = {
     }
 };
 
-// Initialize
-APITestSuite.init();
+// Initialize API Test Suite
+if (window.SubwayBuilderAPI) {
+    APITestSuite.init();
+} else {
+    const checkAPI = setInterval(() => {
+        if (window.SubwayBuilderAPI) {
+            clearInterval(checkAPI);
+            APITestSuite.init();
+        }
+    }, 100);
+}
 
-// Expose for console access
+// Expose both for console access
+window.LifecycleMonitor = LifecycleMonitor;
 window.APITestSuite = APITestSuite;
