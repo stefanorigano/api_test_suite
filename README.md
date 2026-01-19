@@ -1,6 +1,6 @@
 # API Test Suite
 
-> **⚠️ IMPORTANT**: This mod only works with Subway Builder **v0.12.0-modders.6 beta**
+> **⚠️ IMPORTANT**: This mod only works with Subway Builder **0.12.0-rc beta**
 
 A WIP testing framework for the Subway Builder Modding API that validates hooks, UI components, and lifecycle management.
 
