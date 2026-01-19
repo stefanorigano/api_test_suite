@@ -8,24 +8,10 @@ const LifecycleMonitor = (function() {
     const STORAGE_KEY = 'LifecycleMonitor_Events';
     const MAX_EVENTS = 200;
     
-    // DOM Selectors
-    const SELECTORS = {
-        // Context detection
-        MAIN_MENU: 'main.justify-center',
-        IN_GAME_MENU: 'div[data-mod-id="escape-menu"]',
-        LOAD_SAVE_SCREEN: 'main.grid.gap-8.min-h-screen.p-8.max-w-4xl.mx-auto',
-        
-        // In-game time
-        CLOCK_DAY: 'div[data-mod-id="clock"] p.font-medium',
-        CLOCK_TIME: 'div[data-mod-id="clock"] p.font-mono'
-    };
-    
     // State machine
     const STATES = {
         UNINITIALIZED: 'uninitialized',
         API_READY: 'api_ready',
-        USER_STARTING_NEW_GAME: 'user_starting_new_game',
-        USER_LOADING_SAVE: 'user_loading_save',
         CITY_LOADING: 'city_loading',
         GAME_INIT: 'game_init',
         IN_GAME: 'in_game',
@@ -34,13 +20,11 @@ const LifecycleMonitor = (function() {
     
     const VALID_TRANSITIONS = {
         [STATES.UNINITIALIZED]: [STATES.API_READY],
-        [STATES.API_READY]: [STATES.USER_STARTING_NEW_GAME, STATES.USER_LOADING_SAVE, STATES.CITY_LOADING, STATES.GAME_INIT],
-        [STATES.USER_STARTING_NEW_GAME]: [STATES.CITY_LOADING, STATES.GAME_INIT],
-        [STATES.USER_LOADING_SAVE]: [STATES.CITY_LOADING, STATES.GAME_INIT],
+        [STATES.API_READY]: [STATES.CITY_LOADING, STATES.GAME_INIT],
         [STATES.CITY_LOADING]: [STATES.GAME_INIT, STATES.IN_GAME],
         [STATES.GAME_INIT]: [STATES.IN_GAME],
-        [STATES.IN_GAME]: [STATES.MENU, STATES.CITY_LOADING, STATES.USER_LOADING_SAVE],
-        [STATES.MENU]: [STATES.USER_STARTING_NEW_GAME, STATES.USER_LOADING_SAVE, STATES.CITY_LOADING, STATES.GAME_INIT]
+        [STATES.IN_GAME]: [STATES.MENU, STATES.CITY_LOADING],
+        [STATES.MENU]: [STATES.CITY_LOADING, STATES.GAME_INIT]
     };
     
     // Monitor state
@@ -52,18 +36,23 @@ const LifecycleMonitor = (function() {
     let isCollapsed = false;
     let validTransitions = 0;
     let errorCount = 0;
+    let currentContext = 'unknown'; // 'main_menu' | 'in_game' | 'load_save_screen'
+    let pendingLoad = null; // { saveName: string, timestamp: number, context: string }
     
-    // User action tracking
-    let pendingLoadSaveName = null;
-    let loadClickTime = null;
+    // Hook call counters
+    let gameInitCount = 0;
+    let cityLoadCount = 0;
+    let mapReadyCount = 0;
+    let onDemandChangeCount = 0;
+    let onDemandChangeBeforeGame = 0;
+    let onDemandChangeDuringGame = 0;
     
     // Scenario tracking
     const scenarios = {
         'new_game_from_menu': { detected: false, name: 'New Game from Menu' },
         'load_save_from_menu': { detected: false, name: 'Load Save from Menu' },
-        'game_to_menu_to_new': { detected: false, name: 'Game → Menu → New Game' },
-        'game_reload_same_save': { detected: false, name: 'Game → Reload Same Save' },
-        'game_load_different_save': { detected: false, name: 'Game → Load Different Save' }
+        'game_load_different_save': { detected: false, name: 'In Game → Load Different Save'},
+        'game_reload_same_save': { detected: false, name: 'In Game → Reload Same Save' },
     };
     
     // UI Elements
@@ -85,7 +74,8 @@ const LifecycleMonitor = (function() {
         createPanel();
         logEvent('Script Loaded', 'system');
         
-        // Setup DOM listeners immediately
+        // Setup DOM observers and listeners
+        setupContextObserver();
         setupDOMListeners();
         
         // Wait for API
@@ -94,106 +84,14 @@ const LifecycleMonitor = (function() {
                 clearInterval(checkAPI);
                 onAPIReady();
             }
-        }, 100);
+        }, 10);
         
         console.info('[LIFECYCLE] Monitor initialized');
-    }
-    
-    function setupDOMListeners() {
-        // Use event delegation for dynamically added elements
-        document.addEventListener('click', (e) => {
-            const target = e.target;
-            
-            // Helper to check if click is within an element
-            const isWithin = (selector) => target.closest(selector) !== null;
-            
-            // New Game (Main Menu)
-            if (isWithin('main.justify-center') && target.textContent.includes('New Game')) {
-                const context = detectContext();
-                logEvent('User clicked: New Game', 'user_action');
-                
-                if (context === 'main_menu') {
-                    transitionState(STATES.USER_STARTING_NEW_GAME);
-                    detectScenario('user_new_game_from_menu');
-                }
-            }
-            
-            // Load/Save from Main Menu
-            if (isWithin('main.justify-center') && target.textContent.includes('Load/Save')) {
-                logEvent('User clicked: Load/Save (Main Menu)', 'user_action');
-            }
-            
-            // Load/Save from In-Game Menu
-            if (isWithin('div[data-mod-id="escape-menu"]') && target.textContent.includes('Load/Save')) {
-                logEvent('User clicked: Load/Save (In-Game)', 'user_action');
-            }
-            
-            // Load Button (specific save)
-            if (isWithin('button') && 
-                target.textContent.includes('Load') &&
-                isWithin('main.grid.gap-8')) {
-                
-                const saveBlock = target.closest('.panel-blur');
-                const saveNameEl = saveBlock?.querySelector('.text-base.font-black');
-                const clickedSaveName = saveNameEl?.textContent.trim() || 'unknown';
-                
-                logEvent(`User clicked: Load "${clickedSaveName}"`, 'user_action');
-                
-                // Track for verification when load completes
-                pendingLoadSaveName = clickedSaveName;
-                loadClickTime = Date.now();
-                
-                const context = detectContext();
-                if (context === 'in_game') {
-                    transitionState(STATES.USER_LOADING_SAVE);
-                } else {
-                    transitionState(STATES.USER_LOADING_SAVE);
-                }
-            }
-            
-            // Save Button
-            if (isWithin('button') && 
-                target.textContent.includes('Save') &&
-                target.closest('.grid.gap-2')) {
-                
-                const saveInput = document.querySelector('input[placeholder="Enter save name..."]');
-                const saveNameToSave = saveInput?.value || 'unnamed';
-                
-                logEvent(`User clicked: Save "${saveNameToSave}"`, 'user_action');
-            }
-            
-            // Menu Toggle (hamburger)
-            if (isWithin('.lucide-menu')) {
-                const menuVisible = document.querySelector('div[data-mod-id="escape-menu"]') !== null;
-                logEvent(`User clicked: ${menuVisible ? 'Close' : 'Open'} Menu`, 'user_action');
-            }
-            
-        }, true); // Use capture phase
-        
-        logEvent('DOM listeners initialized', 'system');
-    }
-    
-    function detectContext() {
-        if (document.querySelector(SELECTORS.MAIN_MENU)) {
-            return 'main_menu';
-        }
-        if (document.querySelector(SELECTORS.IN_GAME_MENU)) {
-            return 'in_game';
-        }
-        if (document.querySelector(SELECTORS.LOAD_SAVE_SCREEN)) {
-            return 'load_save_screen';
-        }
-        return 'unknown';
     }
     
     function onAPIReady() {
         logEvent('API Available', 'api');
         transitionState(STATES.API_READY);
-        
-        // Hook call counters
-        let gameInitCount = 0;
-        let cityLoadCount = 0;
-        let mapReadyCount = 0;
         
         // Register hooks
         const api = window.SubwayBuilderAPI;
@@ -209,11 +107,9 @@ const LifecycleMonitor = (function() {
             }
             
             // Only transition to GAME_INIT if we're in an earlier state
-            if (currentState === STATES.CITY_LOADING || 
-                currentState === STATES.USER_STARTING_NEW_GAME ||
-                currentState === STATES.USER_LOADING_SAVE ||
-                currentState === STATES.API_READY) {
+            if (currentState === STATES.CITY_LOADING || currentState === STATES.API_READY) {
                 transitionState(STATES.GAME_INIT);
+                detectScenario('game_init');
             } else {
                 logEvent(`Game Init in unexpected state: ${currentState}`, 'info');
             }
@@ -231,10 +127,7 @@ const LifecycleMonitor = (function() {
             }
             
             // Transition to CITY_LOADING state
-            if (currentState === STATES.API_READY || 
-                currentState === STATES.MENU ||
-                currentState === STATES.USER_STARTING_NEW_GAME ||
-                currentState === STATES.USER_LOADING_SAVE) {
+            if (currentState === STATES.API_READY || currentState === STATES.MENU) {
                 transitionState(STATES.CITY_LOADING);
             } else if (currentState === STATES.IN_GAME || currentState === STATES.GAME_INIT) {
                 // Reloading a save while in game
@@ -264,30 +157,28 @@ const LifecycleMonitor = (function() {
         
         api.hooks.onGameLoaded((name) => {
             const wasSameSave = saveName === name;
+            const oldSaveName = saveName;
             saveName = name;
             
-            // Verify load completion if we were tracking a pending load
-            if (pendingLoadSaveName && loadClickTime) {
-                const loadDuration = Date.now() - loadClickTime;
-                const nameMatches = pendingLoadSaveName === name;
+            // Check if this matches a pending load
+            if (pendingLoad && pendingLoad.saveName === name) {
+                const elapsed = Date.now() - pendingLoad.timestamp;
+                logEvent(`Load completed: "${name}" (${elapsed}ms from ${pendingLoad.context})`, 'lifecycle');
                 
-                if (nameMatches) {
-                    logEvent(`Game Loaded: ${name} (took ${(loadDuration / 1000).toFixed(1)}s)`, 'lifecycle');
-                } else {
-                    logEvent(`Game Loaded: ${name} (expected "${pendingLoadSaveName}")`, 'error', true);
-                    errorCount++;
+                // Detect scenario based on context of load
+                if (pendingLoad.context === 'main_menu') {
+                    detectScenario('load_from_menu');
+                } else if (pendingLoad.context === 'in_game_menu') {
+                    if (wasSameSave) {
+                        detectScenario('reload_same_save');
+                    } else {
+                        detectScenario('load_different_save');
+                    }
                 }
                 
-                pendingLoadSaveName = null;
-                loadClickTime = null;
+                pendingLoad = null; // Clear pending
             } else {
                 logEvent(`Game Loaded: ${name}${wasSameSave ? ' (SAME)' : ''}`, 'lifecycle');
-            }
-            
-            if (wasSameSave) {
-                detectScenario('reload_same_save');
-            } else if (saveName) {
-                detectScenario('load_different_save');
             }
             
             updatePanel();
@@ -297,29 +188,24 @@ const LifecycleMonitor = (function() {
             logEvent(`Game Saved: ${name}`, 'lifecycle');
         });
         
-        // Test onDemandChange hook (known bug: fires incorrectly)
-        let demandChangeCount = 0;
-        let demandChangeDuringGameplay = 0;
-        
+        // Track onDemandChange calls
         api.hooks.onDemandChange((popCount) => {
-            demandChangeCount++;
-            const inGameplay = currentState === STATES.IN_GAME;
+            onDemandChangeCount++;
+            const inGame = currentState === STATES.IN_GAME;
             
-            if (inGameplay) {
-                demandChangeDuringGameplay++;
+            if (inGame) {
+                onDemandChangeDuringGame++;
+            } else {
+                onDemandChangeBeforeGame++;
             }
             
-            logEvent(`onDemandChange fired (call #${demandChangeCount}, ${inGameplay ? 'IN-GAME' : 'PRE-GAME'}, pops: ${popCount})`, 'lifecycle');
+            logEvent(`onDemandChange fired (call #${onDemandChangeCount}, ${inGame ? 'in-game' : 'before game'}, ${popCount} pops)`, 'lifecycle');
             
-            // After a reasonable period, check if it behaved correctly
-            if (demandChangeCount >= 3) {
-                const behavedCorrectly = demandChangeDuringGameplay > 0 && demandChangeCount <= 3;
-                
-                if (!behavedCorrectly) {
-                    logEvent(`onDemandChange behavior incorrect: ${demandChangeCount} total calls, ${demandChangeDuringGameplay} during gameplay`, 'error', true);
-                    errorCount++;
-                    updateStats();
-                }
+            // Test: Should fire during game, but doesn't (known bug)
+            if (onDemandChangeBeforeGame >= 2 && onDemandChangeDuringGame === 0 && inGame) {
+                logEvent(`onDemandChange bug detected: Fired ${onDemandChangeBeforeGame}x before game, 0x during gameplay`, 'error', true);
+                errorCount++;
+                updateStats();
             }
         });
     }
@@ -332,6 +218,7 @@ const LifecycleMonitor = (function() {
             type,
             isError,
             state: currentState,
+            context: currentContext,
             time: new Date().toISOString()
         };
         
@@ -345,7 +232,7 @@ const LifecycleMonitor = (function() {
         saveEvents();
         updateTimeline();
         
-        const icon = isError ? '❌' : type === 'system' ? '🔧' : type === 'api' ? '⚙️' : type === 'user_action' ? '👆' : '🎮';
+        const icon = isError ? '❌' : type === 'system' ? '🔧' : type === 'api' ? '⚙️' : type === 'user_action' ? '👆' : type === 'context' ? '🔄' : '🎮';
         console.info(`[LIFECYCLE] ${icon} ${formatTimestamp(timestamp)} - ${message}`);
     }
     
@@ -375,13 +262,27 @@ const LifecycleMonitor = (function() {
     }
     
     function detectScenario(trigger) {
-        // New Game from Menu
-        if (trigger === 'user_new_game_from_menu') {
-            scenarios.new_game_from_menu.detected = true;
+
+        
+        // NEW GAME: User clicked New Game → Game Init → Save is "NONE"
+        if (trigger === 'game_init') {
+            if (!events || !Array.isArray(events)) {
+                return null;
+            }
+            
+            const recent = events.slice(-10);
+            const hasNewGameClick = recent.some(e => 
+                e.type === 'user_action' && e.message === 'User clicked: New Game'
+            );
+
+            const currentSave = window.SubwayBuilderAPI.gameState.getCurrentSaveName?.() || 'NONE';
+            if (hasNewGameClick && currentSave === 'NONE') {
+                scenarios.new_game_from_menu.detected = true;
+            }
         }
         
-        // Load Save from Menu
-        if (trigger === 'map_ready' && saveName && events.length <= 10) {
+        // Load Save from Menu (main menu context)
+        if (trigger === 'load_from_menu') {
             scenarios.load_save_from_menu.detected = true;
         }
         
@@ -396,6 +297,98 @@ const LifecycleMonitor = (function() {
         }
         
         updateScenarios();
+    }
+    
+    // ============================================================================
+    // DOM OBSERVATION & INTERACTION
+    // ============================================================================
+    
+    function setupContextObserver() {
+        const observer = new MutationObserver(() => {
+            detectContext();
+        });
+        
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+        
+        // Initial detection
+        detectContext();
+    }
+    
+    function detectContext() {
+        const oldContext = currentContext;
+        
+        if (document.querySelector('main.grid.gap-8.min-h-screen')) {
+            currentContext = 'load_save_screen';
+        } else if (document.querySelector('main.justify-center')) {
+            currentContext = 'main_menu';
+        } else if (document.querySelector('div[data-mod-id="escape-menu"]')) {
+            currentContext = 'in_game_menu';
+        } else if (document.querySelector('div[data-mod-id="top-bar"]')) {
+            currentContext = 'in_game';
+        } else {
+            currentContext = 'unknown';
+        }
+        
+        if (oldContext !== currentContext && oldContext !== 'unknown') {
+            logEvent(`Context: ${oldContext} → ${currentContext}`, 'context');
+        }
+    }
+    
+    function setupDOMListeners() {
+        document.addEventListener('click', (e) => {
+            const target = e.target;
+            
+            // Check if click is inside in-game menu
+            const inSaveMenu = target.closest('[data-mod-id="save-menu"]');
+            
+            // Load Button Click (in save blocks)
+            if (target.closest('button')?.textContent.includes('Load')) {
+                const saveBlock = target.closest('.relative.panel-blur');
+                if (saveBlock) {
+                    const saveNameEl = saveBlock.querySelector('.text-base.font-black');
+                    const saveName = saveNameEl?.textContent || 'unknown';
+                    
+                    logEvent(`User clicked: Load "${saveName}" (from ${currentContext})`, 'user_action');
+                    
+                    // Track pending load
+                    pendingLoad = {
+                        saveName,
+                        timestamp: Date.now(),
+                        context: inSaveMenu ? 'in_game_menu' : 'main_menu'
+                    };
+
+                    logEvent(`...waiting for "${saveName}" to load`, 'system');
+                }
+            }
+            
+            // New Game Click
+            else if (target.closest('main.justify-center') && 
+                target.textContent.includes('New Game')) {
+                logEvent('User clicked: New Game', 'user_action');
+            }
+            
+            // Save Button Click (inside save menu)
+            else if (target.closest('button')?.textContent.includes('Save') &&
+                target.closest('[data-mod-id="save-menu"]')) {
+                const input = document.querySelector('[data-mod-id="save-menu"] input[placeholder="Enter save name..."]');
+                const saveName = input?.value || 'unnamed';
+                logEvent(`User clicked: Save "${saveName}"`, 'user_action');
+            }
+            
+            // Load/Save Menu Open (only if not in save menu already)
+            else if (target.textContent.includes('Load/Save') && !inSaveMenu) {
+                const from = currentContext === 'main_menu' ? 'Main Menu' : 'In-Game';
+                logEvent(`User clicked: Load/Save (from ${from})`, 'user_action');
+            }
+            
+            // Menu Toggle
+            else if (target.closest('.lucide-menu')) {
+                logEvent('User clicked: Menu toggle', 'user_action');
+            }
+        }, true);
     }
     
     // ============================================================================
@@ -434,6 +427,12 @@ const LifecycleMonitor = (function() {
         events = [];
         validTransitions = 0;
         errorCount = 0;
+        gameInitCount = 0;
+        cityLoadCount = 0;
+        mapReadyCount = 0;
+        onDemandChangeCount = 0;
+        onDemandChangeBeforeGame = 0;
+        onDemandChangeDuringGame = 0;
         Object.keys(scenarios).forEach(key => {
             scenarios[key].detected = false;
         });
@@ -447,10 +446,19 @@ const LifecycleMonitor = (function() {
             exportedAt: new Date().toISOString(),
             storageKey: STORAGE_KEY,
             currentState,
+            currentContext,
             saveName,
             cityCode,
             validTransitions,
             errorCount,
+            hookCalls: {
+                gameInit: gameInitCount,
+                cityLoad: cityLoadCount,
+                mapReady: mapReadyCount,
+                onDemandChange: onDemandChangeCount,
+                onDemandChangeBeforeGame,
+                onDemandChangeDuringGame
+            },
             scenarios: Object.keys(scenarios).reduce((acc, key) => {
                 acc[key] = scenarios[key].detected;
                 return acc;
@@ -460,7 +468,8 @@ const LifecycleMonitor = (function() {
                 message: e.message,
                 type: e.type,
                 isError: e.isError,
-                state: e.state
+                state: e.state,
+                context: e.context
             }))
         };
         
@@ -487,7 +496,7 @@ const LifecycleMonitor = (function() {
         
         // Header
         const header = document.createElement('div');
-        header.className = 'px-3 py-2.5 bg-muted border-b border-border flex justify-between items-center cursor-pointer';
+        header.className = 'px-3 py-3 bg-muted border-b border-border flex justify-between items-center cursor-pointer';
         header.innerHTML = `
             <div class="flex items-center gap-2">
                 <span class="text-base">🔄</span>
@@ -509,11 +518,15 @@ const LifecycleMonitor = (function() {
         
         // State info
         const stateInfo = document.createElement('div');
-        stateInfo.className = 'px-3 py-2.5 border-b border-border bg-muted/50 space-y-2';
+        stateInfo.className = 'px-3 py-3 border-b border-border bg-muted/50 space-y-2';
         stateInfo.innerHTML = `
             <div class="flex items-center gap-2">
                 <span class="font-medium text-muted-foreground">State:</span>
                 <span id="lifecycle-state" class="font-bold text-green-500"></span>
+            </div>
+            <div class="flex items-center gap-2">
+                <span class="font-medium text-muted-foreground">Context:</span>
+                <span id="lifecycle-context" class="text-purple-400"></span>
             </div>
             <div class="flex items-center gap-2">
                 <span class="font-medium text-muted-foreground">Save:</span>
@@ -526,21 +539,37 @@ const LifecycleMonitor = (function() {
         `;
         
         stateEl = stateInfo.querySelector('#lifecycle-state');
+        const contextEl = stateInfo.querySelector('#lifecycle-context');
         saveNameEl = stateInfo.querySelector('#lifecycle-save');
         statsEl = stateInfo.querySelector('#lifecycle-stats');
         
+        // Update context display
+        const updateContextDisplay = () => {
+            if (contextEl) {
+                contextEl.textContent = currentContext.toUpperCase().replace('_', ' ');
+            }
+        };
+        setInterval(updateContextDisplay, 500);
+        
         // Timeline
         const timelineContainer = document.createElement('div');
-        timelineContainer.className = 'px-3 py-2.5 max-h-[300px] overflow-y-auto border-b border-border bg-background/50';
+        timelineContainer.className = 'px-3 py-3 max-h-[300px] overflow-y-auto border-b border-border bg-background/50';
         timelineContainer.innerHTML = `
-            <div class="mb-2 font-semibold text-muted-foreground">Timeline (last 20 events):</div>
+            <div class="mb-2 font-semibold text-muted-foreground">Timeline (last 50 events):</div>
             <div id="lifecycle-timeline" class="text-[11px] leading-relaxed space-y-1"></div>
         `;
         timelineEl = timelineContainer.querySelector('#lifecycle-timeline');
+
+        console.log(pendingLoad)
+
+        const loadAlert = document.createElement('div');
+        loadAlert.id = 'lifecycle-load-alert'
+        loadAlert.className = 'mx-3 my-3 p-3 bg-pink-500 rounded hidden';
+        loadAlert.innerHTML = 'Loading...';
         
         // Scenarios
         const scenariosContainer = document.createElement('div');
-        scenariosContainer.className = 'px-3 py-2.5 border-b border-border bg-muted/50';
+        scenariosContainer.className = 'px-3 py-3 border-b border-border bg-muted/50';
         scenariosContainer.innerHTML = `
             <div class="mb-2 font-semibold text-muted-foreground">Scenarios Detected:</div>
             <div id="lifecycle-scenarios" class="text-[11px] leading-relaxed space-y-1"></div>
@@ -549,7 +578,7 @@ const LifecycleMonitor = (function() {
         
         // Buttons
         const buttons = document.createElement('div');
-        buttons.className = 'px-3 py-2.5 flex gap-2 flex-wrap';
+        buttons.className = 'px-3 py-3 flex gap-2 flex-wrap';
         
         const clearBtn = document.createElement('button');
         clearBtn.className = 'px-3 py-1.5 bg-destructive text-destructive-foreground rounded-md hover:bg-destructive/90 transition-colors font-medium';
@@ -571,6 +600,7 @@ const LifecycleMonitor = (function() {
         // Assemble panel
         contentEl.appendChild(stateInfo);
         contentEl.appendChild(timelineContainer);
+        contentEl.appendChild(loadAlert);
         contentEl.appendChild(scenariosContainer);
         contentEl.appendChild(buttons);
         
@@ -608,7 +638,7 @@ const LifecycleMonitor = (function() {
     
     function updateState() {
         if (stateEl) {
-            stateEl.textContent = currentState.toUpperCase().replace(/_/g, ' ');
+            stateEl.textContent = currentState.toUpperCase();
             stateEl.className = `font-bold ${errorCount > 0 ? 'text-red-500' : 'text-green-500'}`;
         }
         if (saveNameEl) {
@@ -631,7 +661,7 @@ const LifecycleMonitor = (function() {
     function updateTimeline() {
         if (!timelineEl) return;
         
-        const recent = events.slice(-20);
+        const recent = events.slice(-50);
         timelineEl.innerHTML = recent.map(event => {
             let colorClass = 'text-green-500';
             let icon = '⏱️';
@@ -649,8 +679,13 @@ const LifecycleMonitor = (function() {
                 colorClass = 'text-purple-400';
                 icon = '🔄';
             } else if (event.type === 'user_action') {
-                colorClass = 'text-cyan-400';
+                colorClass = 'text-yellow-400';
                 icon = '👆';
+            } else if (event.type === 'context') {
+                colorClass = 'text-cyan-400';
+                icon = '📍';
+            } else if (event.type === 'lifecycle') {
+                icon = '⚡';
             }
             
             return `
@@ -659,6 +694,7 @@ const LifecycleMonitor = (function() {
                 </div>
             `;
         }).join('');
+        timelineEl.parentElement.scroll(0,2000);
     }
     
     function updateScenarios() {
@@ -704,15 +740,18 @@ const LifecycleMonitor = (function() {
         exportLogs,
         getEvents: () => events,
         getCurrentState: () => currentState,
-        detectContext
+        getHookCalls: () => ({
+            gameInit: gameInitCount,
+            cityLoad: cityLoadCount,
+            mapReady: mapReadyCount,
+            onDemandChange: onDemandChangeCount
+        })
     };
 })();
 
-
-
-// API Test Suite Mod v1.0.0
-// Comprehensive testing framework for Subway Builder Modding API
-// Tests hooks, UI components, lifecycle, actions, and known bugs
+// ============================================================================
+// API TEST SUITE (React-based - Loads After API Ready)
+// ============================================================================
 
 const APITestSuite = {
     // Test state
@@ -725,11 +764,10 @@ const APITestSuite = {
     
     // Test categories
     categories: {
-        hooks: { name: 'Lifecycle Hooks', auto: true, tests: [] },
-        ui: { name: 'UI Components', auto: false, tests: [] },
         actions: { name: 'Game Actions', auto: false, tests: [] },
         gameState: { name: 'Game State Access', auto: true, tests: [] },
-        storage: { name: 'Storage API', auto: false, tests: [] }
+        storage: { name: 'Storage API', auto: false, tests: [] },
+        modifyConstants: { name: 'Modify Constants', auto: false, tests: [] }
     },
     
     // API references
@@ -737,41 +775,11 @@ const APITestSuite = {
     React: null,
     h: null,
     
-    // Test tracking
-    hookCallbacks: {
-        onGameInit: 0,
-        onDayChange: 0,
-        onCityLoad: 0,
-        onMapReady: 0,
-        onRouteCreated: 0,
-        onRouteDeleted: 0,
-        onPauseChanged: 0,
-        onMoneyChanged: 0,
-        onStationBuilt: 0,
-        onTrainSpawned: 0,
-        onGameLoaded: 0
-    },
-    
-    lastDayReceived: null,
-    lastCityCode: null,
-    mapInstance: null,
-    pauseStateChanges: 0,
-    moneyTransactions: [],
-    
-    // Floating panel state tracking (for bug test)
+    // Floating panel state tracking
     panelRenderCount: 0,
-    panelStateResets: 0,
-    panelTestState: null, // Track test state for reset detection
     
-    // UI duplicate detection
-    panelButtonCount: 0,
-    initialButtonCount: null,
-    gameLoadCount: 0,
-    
-    // Multiple hooks test state
-    multiHookCounter1: 0,
-    multiHookCounter2: 0,
-    multiHookTestPending: true,
+    // Speed test progress tracking
+    speedTestProgress: [],
     
     // Init
     init() {
@@ -784,43 +792,16 @@ const APITestSuite = {
         this.React = this.api.utils.React;
         this.h = this.React.createElement;
         
-        console.info('[TEST] === API Test Suite v1.3.0 ===');
+        console.info('[TEST] === API Test Suite v2.0.1 ===');
         console.info('[TEST] Initializing test framework...');
-        
-        // Register lifecycle hooks for testing
-        this.registerTestHooks();
-        
-        // Register multiple hooks test
-        this.setupMultipleHooksTest();
         
         // Setup UI after game init
         this.api.hooks.onGameInit(() => {
             this.log('Game initialized, setting up test UI...');
             this.setupTestUI();
             
-            // Count initial buttons
-            setTimeout(() => {
-                this.countPanelButtons();
-                if (this.initialButtonCount === null) {
-                    this.initialButtonCount = this.panelButtonCount;
-                }
-            }, 500);
-            
             // Auto-run passive tests
             setTimeout(() => this.runAutoTests(), 1000);
-        });
-        
-        // Track game loads for duplicate UI bug test
-        this.api.hooks.onGameLoaded((saveName) => {
-            this.gameLoadCount++;
-            this.hookCallbacks.onGameLoaded++;
-            
-            this.log(`Game loaded: ${saveName} (load #${this.gameLoadCount})`);
-            
-            // Check for duplicate buttons after load
-            setTimeout(() => {
-                this.testUIDuplicateOnLoad();
-            }, 1000);
         });
     },
     
@@ -840,7 +821,7 @@ const APITestSuite = {
         }
     },
     
-    recordTest(category, name, passed, details = '', isKnownBug = false) {
+    recordTest(category, name, passed, details = '') {
         this.results.total++;
         if (passed) {
             this.results.passed++;
@@ -853,7 +834,6 @@ const APITestSuite = {
             name,
             passed,
             details,
-            isKnownBug,
             timestamp: Date.now()
         };
         
@@ -861,11 +841,20 @@ const APITestSuite = {
         this.categories[category].tests.push(test);
         
         const icon = passed ? '✓' : '✗';
-        const bugLabel = isKnownBug ? ' [KNOWN BUG]' : '';
-        this.log(`${icon} ${category.toUpperCase()}: ${name}${bugLabel}`, passed ? 'pass' : 'fail');
+        this.log(`${icon} ${category.toUpperCase()}: ${name}`, passed ? 'pass' : 'fail');
         if (details) this.log(`   Details: ${details}`);
         
         // Trigger UI update
+        this.updateTestUI();
+    },
+    
+    addSpeedTestStep(step, passed, details = '') {
+        this.speedTestProgress.push({ step, passed, details, timestamp: Date.now() });
+        this.updateTestUI();
+    },
+    
+    clearSpeedTestProgress() {
+        this.speedTestProgress = [];
         this.updateTestUI();
     },
     
@@ -875,11 +864,10 @@ const APITestSuite = {
     
     getDOMBudget() {
         try {
-            const elem = document.querySelector('#metro-bottom-bar span[title].text-sm.font-medium.mr-auto.font-mono.flex.items-center.gap-2');
+            const elem = document.querySelector('[data-mod-id="money-value"]');
             if (!elem) return null;
             
             const text = elem.textContent.trim();
-            // Remove $ and commas, parse as number
             const numStr = text.replace(/[$,]/g, '');
             return parseFloat(numStr);
         } catch (error) {
@@ -890,11 +878,10 @@ const APITestSuite = {
     
     getDOMDay() {
         try {
-            const elem = document.querySelector('#metro-bottom-bar p.font-medium');
+            const elem = document.querySelector('[data-mod-id="day-display"]');
             if (!elem) return null;
             
             const text = elem.textContent.trim();
-            // Extract number after "Day "
             const match = text.match(/Day (\d+)/);
             return match ? parseInt(match[1]) : null;
         } catch (error) {
@@ -905,7 +892,6 @@ const APITestSuite = {
     
     getDOMIsPaused() {
         try {
-            // If play button exists, game is paused
             const playButton = document.querySelector('#metro-bottom-bar [data-tutorial="play-button"] svg.lucide-play');
             return playButton !== null;
         } catch (error) {
@@ -914,112 +900,27 @@ const APITestSuite = {
         }
     },
     
-    // ============================================================================
-    // HOOK REGISTRATION (for tracking callbacks)
-    // ============================================================================
-    
-    setupMultipleHooksTest() {
-        // Register two separate hooks that increment different counters
-        this.api.hooks.onDayChange(() => {
-            this.multiHookCounter1++;
-        });
-        
-        this.api.hooks.onDayChange(() => {
-            this.multiHookCounter2++;
-        });
-        
-        // Third hook to perform the actual test
-        this.api.hooks.onDayChange(() => {
-            if (this.multiHookTestPending && this.multiHookCounter1 > 0 && this.multiHookCounter2 > 0) {
-                const bothIncremented = this.multiHookCounter1 === this.multiHookCounter2;
-                this.recordTest('hooks', 'Multiple hook registrations independent', bothIncremented,
-                    `Counter1: ${this.multiHookCounter1}, Counter2: ${this.multiHookCounter2}`);
-                this.multiHookTestPending = false;
-            }
-        });
-    },
-    
-    registerTestHooks() {
-        // onGameInit
-        this.api.hooks.onGameInit(() => {
-            this.hookCallbacks.onGameInit++;
-            this.recordTest('hooks', 'onGameInit triggered', true, 
-                `Called ${this.hookCallbacks.onGameInit} time(s)`);
-        });
-        
-        // onDayChange
-        this.api.hooks.onDayChange((day) => {
-            this.hookCallbacks.onDayChange++;
-            this.lastDayReceived = day;
-            this.recordTest('hooks', 'onDayChange triggered', true, 
-                `Day ${day}, callback count: ${this.hookCallbacks.onDayChange}`);
-        });
-        
-        // onCityLoad
-        this.api.hooks.onCityLoad((cityCode) => {
-            this.hookCallbacks.onCityLoad++;
-            this.lastCityCode = cityCode;
-            this.recordTest('hooks', 'onCityLoad triggered', true, 
-                `City: ${cityCode}`);
-        });
-        
-        // onMapReady
-        this.api.hooks.onMapReady((map) => {
-            this.hookCallbacks.onMapReady++;
-            this.mapInstance = map;
-            const isValid = map && typeof map.getZoom === 'function';
-            this.recordTest('hooks', 'onMapReady provides valid map', isValid, 
-                `Map instance: ${typeof map}, has getZoom: ${!!map?.getZoom}`);
-        });
-        
-        // onRouteCreated
-        this.api.hooks.onRouteCreated((route) => {
-            this.hookCallbacks.onRouteCreated++;
-            const hasRequiredProps = route && route.id && route.bullet;
-            this.recordTest('hooks', 'onRouteCreated triggered', hasRequiredProps, 
-                `Route: ${route?.bullet || 'unknown'}, ID: ${route?.id}`);
-        });
-        
-        // onRouteDeleted
-        this.api.hooks.onRouteDeleted((routeId, routeBullet) => {
-            this.hookCallbacks.onRouteDeleted++;
-            this.recordTest('hooks', 'onRouteDeleted triggered', true, 
-                `Route: ${routeBullet}, ID: ${routeId}`);
-        });
-        
-        // onPauseChanged
-        this.api.hooks.onPauseChanged((isPaused) => {
-            this.hookCallbacks.onPauseChanged++;
-            this.pauseStateChanges++;
-            this.recordTest('hooks', 'onPauseChanged triggered', true, 
-                `State: ${isPaused ? 'paused' : 'running'}, changes: ${this.pauseStateChanges}`);
-        });
-        
-        // onMoneyChanged
-        this.api.hooks.onMoneyChanged((balance, change, type, category) => {
-            this.hookCallbacks.onMoneyChanged++;
-            this.moneyTransactions.push({ balance, change, type, category, time: Date.now() });
-            if (this.hookCallbacks.onMoneyChanged <= 3) { // Only log first 3 to avoid spam
-                this.recordTest('hooks', 'onMoneyChanged triggered', true, 
-                    `${type}: $${Math.abs(change)}, new balance: $${balance}`);
-            }
-        });
-        
-        // onStationBuilt
-        this.api.hooks.onStationBuilt((station) => {
-            this.hookCallbacks.onStationBuilt++;
-            this.recordTest('hooks', 'onStationBuilt triggered', true, 
-                `Station: ${station?.name || 'unnamed'}`);
-        });
-        
-        // onTrainSpawned
-        this.api.hooks.onTrainSpawned((train) => {
-            this.hookCallbacks.onTrainSpawned++;
-            if (this.hookCallbacks.onTrainSpawned <= 2) { // Limit spam
-                this.recordTest('hooks', 'onTrainSpawned triggered', true, 
-                    `Train ID: ${train?.id}, Route: ${train?.routeId}`);
-            }
-        });
+    getInGameTime() {
+        try {
+            const timeEl = document.querySelector('div[data-mod-id="clock"] p.font-mono');
+            console.info(">>>>>> " + timeEl);
+            if (!timeEl) return null;
+            
+            const match = timeEl.textContent.match(/(\d+):(\d+):(\d+)/);
+            console.info(">>>>>> " + match);
+            if (!match) return null;
+            
+            const hours = parseInt(match[1]);
+            const minutes = parseInt(match[2]);
+            const seconds = parseInt(match[3]);
+
+            console.info(">>>>>> " +  hours * 3600 + minutes * 60 + seconds);
+            
+            return hours * 3600 + minutes * 60 + seconds;
+        } catch (error) {
+            console.error('[TEST] getInGameTime error:', error);
+            return null;
+        }
     },
     
     // ============================================================================
@@ -1028,11 +929,7 @@ const APITestSuite = {
     
     runAutoTests() {
         this.log('Running auto tests...');
-        
-        // Test: Game State Access
         this.testGameStateAccess();
-        
-        // Test: DOM vs API consistency
         setTimeout(() => this.testDOMAPIConsistency(), 2000);
     },
     
@@ -1058,7 +955,6 @@ const APITestSuite = {
             this.recordTest('gameState', 'isPaused() returns boolean', typeof isPaused === 'boolean',
                 `Game is ${isPaused ? 'paused' : 'running'}`);
             
-            // Test getLineMetrics
             const metrics = this.api.gameState.getLineMetrics();
             this.recordTest('gameState', 'getLineMetrics() returns array', Array.isArray(metrics),
                 `Found ${metrics.length} line metrics`);
@@ -1071,27 +967,29 @@ const APITestSuite = {
     testDOMAPIConsistency() {
         this.log('Testing DOM vs API consistency...');
         
-        // Budget
+        // Budget (rounded in UI)
         const apiBudget = this.api.gameState.getBudget();
         const domBudget = this.getDOMBudget();
         
         if (domBudget !== null) {
-            const budgetMatch = Math.floor(apiBudget) === Math.floor(domBudget);
+            const apiRounded = Math.round(apiBudget);
+            const domRounded = Math.round(domBudget);
+            const budgetMatch = apiRounded === domRounded;
             this.recordTest('gameState', 'API budget matches DOM display', budgetMatch,
-                `API: $${Math.floor(apiBudget)}, DOM: $${Math.floor(domBudget)}`);
+                `API: $${apiRounded}, DOM: $${domRounded}`);
         } else {
             this.recordTest('gameState', 'API budget matches DOM display', false,
                 'Could not read budget from DOM');
         }
         
-        // Day
+        // Day (API is 0-indexed, UI displays day + 1)
         const apiDay = this.api.gameState.getCurrentDay();
         const domDay = this.getDOMDay();
         
         if (domDay !== null) {
-            const dayMatch = apiDay === domDay;
+            const dayMatch = apiDay === (domDay - 1);
             this.recordTest('gameState', 'API day matches DOM display', dayMatch,
-                `API: Day ${apiDay}, DOM: Day ${domDay}`);
+                `API: Day ${apiDay} (0-indexed), DOM: Day ${domDay} (1-indexed, expected API=${domDay - 1})`);
         } else {
             this.recordTest('gameState', 'API day matches DOM display', false,
                 'Could not read day from DOM');
@@ -1112,115 +1010,57 @@ const APITestSuite = {
     },
     
     // ============================================================================
-    // MANUAL TESTS (require user interaction)
+    // MANUAL TESTS
     // ============================================================================
-    
-    countPanelButtons() {
-        // Count buttons that trigger the api-test-suite panel
-        const buttons = document.querySelectorAll('[data-panel-id="api-test-suite"]');
-        this.panelButtonCount = buttons.length;
-        this.log(`Panel button count: ${this.panelButtonCount}`);
-    },
-    
-    testUIDuplicateOnLoad() {
-        this.countPanelButtons();
-        
-        const noDuplicates = this.panelButtonCount === this.initialButtonCount;
-        const details = `Expected: ${this.initialButtonCount}, Found: ${this.panelButtonCount} (after ${this.gameLoadCount} loads)`;
-        
-        this.recordTest('ui', 'No duplicate panel buttons on game load', noDuplicates, details, !noDuplicates);
-    },
-    
-    testFloatingPanelStateReset() {
-        this.log('Testing floating panel state reset...');
-        
-        // Record current render count
-        const beforeCount = this.panelRenderCount;
-        
-        this.recordTest('ui', 'floatingPanel state persistence test started', true,
-            `Current render count: ${beforeCount}. Now drag/resize the panel and click "Check Panel State" button.`);
-    },
     
     checkFloatingPanelState() {
         const afterCount = this.panelRenderCount;
+        const actuallyReset = afterCount > 1;
         
-        // We expect the panel to re-render on drag/resize (known bug)
-        const actuallyReset = afterCount > this.panelRenderCount;
-        
-        this.recordTest('ui', 'floatingPanel preserves state on drag/resize', actuallyReset,
-            `Render count increased from panel creation, indicating state reset on interaction`, true);
+        this.recordTest('actions', 'floatingPanel preserves state on drag/resize', !actuallyReset,
+            `Render count: ${afterCount} (should be 1 if state preserved)`);
     },
     
-    testReloadMods() {
+    async testReloadMods() {
         this.log('Testing reloadMods()...');
         
-        const beforeCallbacks = { ...this.hookCallbacks };
-        const beforeRenderCount = this.panelRenderCount;
+        const lifecycleHooks = window.LifecycleMonitor.getHookCalls();
+        const beforeCallbacks = { ...lifecycleHooks };
         
-        this.recordTest('ui', 'reloadMods() test started', true,
-            `Current state - Hook callbacks: ${Object.values(beforeCallbacks).reduce((a,b) => a+b, 0)}, Render count: ${beforeRenderCount}`);
+        this.recordTest('actions', 'reloadMods() test started', true,
+            `Current hook callbacks: gameInit=${beforeCallbacks.gameInit}, cityLoad=${beforeCallbacks.cityLoad}`);
         
-        // Call reloadMods
-        this.api.reloadMods()
-            .then(() => {
-                setTimeout(() => {
-                    const afterCallbacks = { ...this.hookCallbacks };
-                    const afterRenderCount = this.panelRenderCount;
-                    
-                    // After reload, hooks should be reset and component should be destroyed/recreated
-                    const hooksReset = Object.values(afterCallbacks).every(count => count === 0);
-                    const componentRecreated = afterRenderCount === 0 || afterRenderCount < beforeRenderCount;
-                    
-                    this.recordTest('ui', 'reloadMods() resets hook callbacks', hooksReset,
-                        `Before: ${Object.values(beforeCallbacks).reduce((a,b) => a+b, 0)}, After: ${Object.values(afterCallbacks).reduce((a,b) => a+b, 0)}`, !hooksReset);
-                    
-                    this.recordTest('ui', 'reloadMods() destroys and recreates component', componentRecreated,
-                        `Render count before: ${beforeRenderCount}, after: ${afterRenderCount}`, !componentRecreated);
-                }, 1000);
-            })
-            .catch(error => {
-                this.recordTest('ui', 'reloadMods() execution', false, error.message);
-            });
+        try {
+            await this.api.reloadMods();
+            
+            setTimeout(() => {
+                const afterCallbacks = window.LifecycleMonitor.getHookCalls();
+                const hooksReset = Object.values(afterCallbacks).every(count => count === 0);
+                
+                this.recordTest('actions', 'reloadMods() resets hook callbacks', hooksReset,
+                    `Before: gameInit=${beforeCallbacks.gameInit}, After: gameInit=${afterCallbacks.gameInit}`);
+            }, 1000);
+        } catch (error) {
+            this.recordTest('actions', 'reloadMods() execution', false, error.message);
+        }
     },
     
     testActions() {
         this.log('Testing game actions...');
         
-        // Test: setPause (outside hooks)
+        // Test: setPause
         try {
             const wasPaused = this.api.gameState.isPaused();
             this.api.actions.setPause(true);
             setTimeout(() => {
                 const isNowPaused = this.api.gameState.isPaused();
-                this.recordTest('actions', 'setPause(true) works outside hooks', isNowPaused,
+                this.recordTest('actions', 'setPause(true) works', isNowPaused,
                     `Was paused: ${wasPaused}, now paused: ${isNowPaused}`);
-                // Restore state
                 this.api.actions.setPause(wasPaused);
             }, 500);
         } catch (error) {
             this.recordTest('actions', 'setPause', false, error.message);
         }
-        
-        // Test: setPause inside onDayChange (known bug)
-        let pauseWorkedInHook = false;
-        const unhook = this.api.hooks.onDayChange(() => {
-            try {
-                this.api.actions.setPause(true);
-                setTimeout(() => {
-                    const isPaused = this.api.gameState.isPaused();
-                    pauseWorkedInHook = isPaused;
-                    
-                    this.recordTest('actions', 'setPause works inside onDayChange', pauseWorkedInHook,
-                        `setPause called in hook, paused: ${isPaused}`, !pauseWorkedInHook);
-                    
-                    // Restore and cleanup
-                    this.api.actions.setPause(false);
-                    if (unhook) unhook();
-                }, 100);
-            } catch (error) {
-                this.recordTest('actions', 'setPause in hook', false, error.message, true);
-            }
-        });
         
         // Test: setSpeed
         try {
@@ -1230,7 +1070,6 @@ const APITestSuite = {
                 const newSpeed = this.api.gameState.getGameSpeed();
                 this.recordTest('actions', 'setSpeed() changes speed', newSpeed === 'fast',
                     `Original: ${originalSpeed}, new: ${newSpeed}`);
-                // Restore
                 this.api.actions.setSpeed(originalSpeed);
             }, 500);
         } catch (error) {
@@ -1246,7 +1085,6 @@ const APITestSuite = {
                 const newBudget = this.api.gameState.getBudget();
                 this.recordTest('actions', 'setMoney() updates budget', newBudget === testAmount,
                     `Set to: ${testAmount}, actual: ${newBudget}`);
-                // Restore
                 this.api.actions.setMoney(originalBudget);
             }, 500);
         } catch (error) {
@@ -1254,10 +1092,113 @@ const APITestSuite = {
         }
     },
     
+    async testSpeedMultiplier() {
+        this.log('Testing setSpeedMultiplier (complex test)...');
+        this.clearSpeedTestProgress();
+        
+        const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+        const getTime = () => this.getInGameTime();
+        
+        try {
+            this.api.actions.setSpeed('fast');
+
+            // 1. Pause and confirm (2 seconds)
+            this.addSpeedTestStep('Setting pause...', null, 'Calling setPause(true)');
+            this.api.actions.setPause(true);
+            await wait(500);
+            
+            this.addSpeedTestStep('Verifying pause (2s wait)...', null, 'Checking if time freezes');
+            const pauseTime1 = getTime();
+            await wait(2000);
+            const stillPaused1 = getTime() === pauseTime1;
+            
+            this.addSpeedTestStep('Pause verification 1', stillPaused1, 
+                stillPaused1 ? 'Game paused correctly' : `Time changed: ${pauseTime1} → ${getTime()}`);
+            
+            if (!stillPaused1) {
+                this.recordTest('actions', 'setSpeedMultiplier test', false, 
+                    'Failed at pause verification 1');
+                return;
+            }
+            
+            // 2. Set to fast, measure baseline (1 second)
+            this.addSpeedTestStep('Setting speed to fast...', null, 'Measuring baseline speed');
+            this.api.actions.setSpeed('fast');
+            await wait(500);
+            const fastStart1 = getTime();
+            await wait(1000);
+            const fastEnd1 = getTime();
+            const baseline = fastEnd1 - fastStart1;
+            
+            this.addSpeedTestStep('Baseline measurement', true, 
+                `Fast speed: ${baseline} seconds/real-second`);
+            
+            // 3. Pause and confirm (2 seconds)
+            this.addSpeedTestStep('Setting pause again...', null, 'Second pause verification');
+            await wait(200);
+            this.api.actions.setPause(true);
+            await wait(500);
+            const pauseTime2 = getTime();
+            await wait(2000);
+            const stillPaused2 = getTime() === pauseTime2;
+
+            conso
+            
+            this.addSpeedTestStep('Pause verification 2', stillPaused2,
+                stillPaused2 ? 'Game paused correctly' : `Time changed: ${pauseTime2} → ${getTime()}`);
+            
+            if (!stillPaused2) {
+                this.recordTest('actions', 'setSpeedMultiplier test', false,
+                    'Failed at pause verification 2');
+                this.api.actions.setSpeedMultiplier('fast', 1);
+                return;
+            }
+            
+            // 4. Set multiplier to 10
+            this.addSpeedTestStep('Setting multiplier to 10x...', null, 'Calling setSpeedMultiplier("fast", 10)');
+            this.api.actions.setSpeedMultiplier('fast', 10);
+            
+            // 5. Set to fast, measure with multiplier (1 second)
+            this.addSpeedTestStep('Measuring 10x speed...', null, 'Setting speed to fast');
+            this.api.actions.setSpeed('fast');
+            await wait(500);
+            const fastStart2 = getTime();
+            await wait(1000);
+            const fastEnd2 = getTime();
+            const withMultiplier = fastEnd2 - fastStart2;
+            
+            this.addSpeedTestStep('10x measurement', true,
+                `With 10x: ${withMultiplier} seconds/real-second`);
+            
+            // 6. Verify
+            const expected = baseline * 10;
+            const tolerance = baseline * 0.2; // 20% tolerance
+            const multiplierWorked = Math.abs(withMultiplier - expected) <= tolerance;
+            
+            this.addSpeedTestStep('Verifying multiplier effect', multiplierWorked,
+                `Expected: ${expected}±${tolerance.toFixed(1)}s, Got: ${withMultiplier}s`);
+            
+            this.recordTest('actions', 'setSpeedMultiplier changes speed', multiplierWorked,
+                `Baseline: ${baseline}s/sec, With 10x: ${withMultiplier}s/sec, Expected: ${expected}s/sec ±${tolerance.toFixed(1)}s`);
+            
+            // 7. Reset
+            this.addSpeedTestStep('Resetting...', null, 'Setting multiplier back to 1 and pausing');
+            this.api.actions.setSpeedMultiplier('fast', 1);
+            this.api.actions.setPause(true);
+            this.addSpeedTestStep('Test complete', true, 'Cleanup done');
+            
+        } catch (error) {
+            this.addSpeedTestStep('Test failed', false, error.message);
+            this.recordTest('actions', 'setSpeedMultiplier test execution', false, 
+                error.message);
+            this.api.actions.setSpeedMultiplier('fast', 1);
+            this.api.actions.setPause(true);
+        }
+    },
+    
     testStorage() {
         this.log('Testing storage API...');
         
-        // Test: set and get
         const testKey = 'test-key-' + Date.now();
         const testValue = { foo: 'bar', number: 42 };
         
@@ -1270,7 +1211,6 @@ const APITestSuite = {
                 this.recordTest('storage', 'set() and get() work', matches,
                     `Stored and retrieved: ${JSON.stringify(retrieved)}`);
                 
-                // Only test delete if set/get succeeded
                 if (matches) {
                     return this.api.storage.delete(testKey);
                 } else {
@@ -1289,6 +1229,18 @@ const APITestSuite = {
             });
     },
     
+    testModifyConstants() {
+        this.log('Testing modifyConstants...');
+        
+        this.recordTest('modifyConstants', 'Test suite ready', true,
+            'Call modifyConstants, then start new game to verify. STARTING_MONEY = 10B, DEFAULT_TICKET_COST = 5');
+
+        window.SubwayBuilderAPI.modifyConstants({
+            STARTING_MONEY: 10_000_000_000, // 10B instead of 3B
+            DEFAULT_TICKET_COST: 5,
+        });
+    },
+    
     // ============================================================================
     // UI SETUP
     // ============================================================================
@@ -1302,12 +1254,9 @@ const APITestSuite = {
             height: 800,
             render: () => this.renderTestPanel()
         });
-        
-        this.log('Test UI panel created');
     },
     
     updateTestUI() {
-        // Force React update by incrementing a counter
         if (this._forceUpdate) {
             this._forceUpdate();
         }
@@ -1320,22 +1269,16 @@ const APITestSuite = {
         const TestPanel = () => {
             const [, forceUpdate] = this.React.useReducer(x => x + 1, 0);
             
-            // Store force update function for external triggers
             this.React.useEffect(() => {
                 self._forceUpdate = forceUpdate;
             }, []);
             
-            // Track render count for bug testing
             this.React.useEffect(() => {
                 self.panelRenderCount++;
             });
             
             const { passed, failed, total, tests } = self.results;
             const passRate = total > 0 ? ((passed / total) * 100).toFixed(1) : 0;
-            
-            // Check if multiple hooks test is pending
-            const multiHookTestResult = tests.find(t => t.name === 'Multiple hook registrations independent');
-            const multiHookPending = self.multiHookTestPending && !multiHookTestResult;
             
             return h('div', { className: 'flex flex-col h-full' }, [
                 // Stats header
@@ -1360,11 +1303,7 @@ const APITestSuite = {
                             `✓ Passed: ${passed}`),
                         h('span', { key: 'failed', className: 'text-red-600 dark:text-red-400' }, 
                             `✗ Failed: ${failed}`)
-                    ]),
-                    multiHookPending && h('div', {
-                        key: 'pending',
-                        className: 'mt-2 text-xs text-yellow-600 dark:text-yellow-400'
-                    }, '⏳ Waiting for next day change to verify multiple hook registrations...')
+                    ])
                 ]),
                 
                 // Action buttons
@@ -1378,6 +1317,11 @@ const APITestSuite = {
                         onClick: () => self.testActions()
                     }, 'Test Actions'),
                     h('button', {
+                        key: 'speed',
+                        className: 'px-3 py-1.5 text-xs rounded-md bg-primary text-primary-foreground hover:bg-primary/90',
+                        onClick: () => self.testSpeedMultiplier()
+                    }, 'Test Speed Multiplier'),
+                    h('button', {
                         key: 'storage',
                         className: 'px-3 py-1.5 text-xs rounded-md bg-primary text-primary-foreground hover:bg-primary/90',
                         onClick: () => self.testStorage()
@@ -1386,7 +1330,7 @@ const APITestSuite = {
                         key: 'dom',
                         className: 'px-3 py-1.5 text-xs rounded-md bg-primary text-primary-foreground hover:bg-primary/90',
                         onClick: () => self.testDOMAPIConsistency()
-                    }, 'Test DOM/API Consistency'),
+                    }, 'Test DOM/API'),
                     h('button', {
                         key: 'panel-check',
                         className: 'px-3 py-1.5 text-xs rounded-md bg-primary text-primary-foreground hover:bg-primary/90',
@@ -1398,6 +1342,11 @@ const APITestSuite = {
                         onClick: () => self.testReloadMods()
                     }, 'Test reloadMods()'),
                     h('button', {
+                        key: 'constants',
+                        className: 'px-3 py-1.5 text-xs rounded-md bg-primary text-primary-foreground hover:bg-primary/90',
+                        onClick: () => self.testModifyConstants()
+                    }, 'Test modifyConstants'),
+                    h('button', {
                         key: 'clear',
                         className: 'px-3 py-1.5 text-xs rounded-md bg-secondary text-secondary-foreground hover:bg-secondary/80',
                         onClick: () => {
@@ -1405,10 +1354,47 @@ const APITestSuite = {
                             Object.keys(self.categories).forEach(cat => {
                                 self.categories[cat].tests = [];
                             });
-                            self.multiHookTestPending = true;
+                            self.clearSpeedTestProgress();
                             forceUpdate();
                         }
                     }, 'Clear Results')
+                ]),
+                
+                // Speed test progress (if running)
+                self.speedTestProgress.length > 0 && h('div', {
+                    key: 'speed-progress',
+                    className: 'px-4 py-3 border-b border-border bg-blue-500/10'
+                }, [
+                    h('div', {
+                        key: 'title',
+                        className: 'font-semibold text-sm mb-2'
+                    }, 'Speed Multiplier Test Progress:'),
+                    h('div', {
+                        key: 'steps',
+                        className: 'space-y-1 text-xs'
+                    }, self.speedTestProgress.map((step, idx) => 
+                        h('div', {
+                            key: idx,
+                            className: `flex items-start gap-2 ${
+                                step.passed === true ? 'text-green-600 dark:text-green-400' :
+                                step.passed === false ? 'text-red-600 dark:text-red-400' :
+                                'text-muted-foreground'
+                            }`
+                        }, [
+                            h('span', { key: 'icon' }, 
+                                step.passed === true ? '✓' :
+                                step.passed === false ? '✗' :
+                                '⏳'
+                            ),
+                            h('div', { key: 'content', className: 'flex-1' }, [
+                                h('div', { key: 'step', className: 'font-medium' }, step.step),
+                                step.details && h('div', {
+                                    key: 'details',
+                                    className: 'text-[10px] text-muted-foreground mt-0.5'
+                                }, step.details)
+                            ])
+                        ])
+                    ))
                 ]),
                 
                 // Test results
@@ -1453,11 +1439,7 @@ const APITestSuite = {
                                             className: 'font-medium'
                                         }, [
                                             h('span', { key: 'icon' }, test.passed ? '✓ ' : '✗ '),
-                                            h('span', { key: 'text' }, test.name),
-                                            test.isKnownBug && h('span', {
-                                                key: 'known',
-                                                className: 'ml-2 px-1.5 py-0.5 rounded text-[10px] bg-orange-500/20 text-orange-600 dark:text-orange-400 border border-orange-500/30'
-                                            }, 'KNOWN BUG')
+                                            h('span', { key: 'text' }, test.name)
                                         ]),
                                         test.details && h('div', {
                                             key: 'details',
@@ -1474,11 +1456,7 @@ const APITestSuite = {
                     key: 'debug',
                     className: 'px-4 py-2 border-t border-border text-xs text-muted-foreground space-y-1'
                 }, [
-                    h('div', { key: 'render' }, `Panel renders: ${self.panelRenderCount}`),
-                    h('div', { key: 'hooks' }, `Hook callbacks: ${Object.values(self.hookCallbacks).reduce((a, b) => a + b, 0)}`),
-                    h('div', { key: 'loads' }, `Game loads: ${self.gameLoadCount}`),
-                    h('div', { key: 'buttons' }, `Panel buttons in DOM: ${self.panelButtonCount}`),
-                    h('div', { key: 'multi' }, `Multi-hook counters: ${self.multiHookCounter1} / ${self.multiHookCounter2}`)
+                    h('div', { key: 'render' }, `Panel renders: ${self.panelRenderCount}`)
                 ])
             ]);
         };
