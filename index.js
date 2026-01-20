@@ -1142,7 +1142,6 @@ const APITestSuite = {
             await wait(2000);
             const stillPaused2 = getTime() === pauseTime2;
 
-            conso
             
             this.addSpeedTestStep('Pause verification 2', stillPaused2,
                 stillPaused2 ? 'Game paused correctly' : `Time changed: ${pauseTime2} → ${getTime()}`);
